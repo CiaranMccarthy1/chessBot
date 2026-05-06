@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -67,7 +68,7 @@ func defaultConfig() TrainConfig {
 
 		MiniBatchSize:    128,
 		UpdatesPerBatch:  8,
-		ReplayCapacity:   50000,
+		ReplayCapacity:   100000,
 		MinReplayToTrain: 2000,
 
 		ValueLossWeight:  1.0,
@@ -102,6 +103,7 @@ type TrainingState struct {
 	TotalGames    int
 	CurrentElo    int
 	TargetElo     int
+	EloCheckEvery int
 	AvgLoss       float32
 	AvgValueLoss  float32
 	AvgPolicyLoss float32
@@ -154,8 +156,6 @@ func render(s *TrainingState) {
 
 	fmt.Print(clrScreen)
 	elapsed := time.Since(s.StartTime).Round(time.Second)
-	nextCheck := s.LastEloCheck.Add(time.Duration(s.Batch%5) * time.Minute)
-	_ = nextCheck
 
 	fmt.Printf("%s%sGo-Torch Chess — Autonomous Training%s\n", bold, cyan, reset)
 	fmt.Printf("%s%s%s\n\n", gray, "────────────────────────────────────────────────────────", reset)
@@ -179,6 +179,10 @@ func render(s *TrainingState) {
 		gray, reset, s.TotalGames,
 		gray, reset, s.ReplaySize,
 		gray, reset, elapsed)
+	if s.EloCheckEvery > 0 {
+		nextEloBatch := ((s.Batch / s.EloCheckEvery) + 1) * s.EloCheckEvery
+		fmt.Printf("  %sNext ELO check:%s batch %d\n", gray, reset, nextEloBatch)
+	}
 
 	fmt.Printf("  %sLoss%s total=%.4f value=%.4f policy=%.4f\n\n",
 		gray, reset, s.AvgLoss, s.AvgValueLoss, s.AvgPolicyLoss)
@@ -377,9 +381,13 @@ func main() {
 	net := NewAlphaNet(rng)
 	replay := NewReplayBuffer(cfg.ReplayCapacity)
 	bestPath := filepath.Join(filepath.Dir(cfg.CheckpointPath), "best.gob")
+	var currentTutorDepthAtomic int32
+	var weakDepthAtomic int32
 	currentTutorDepth := int(StockfishStandard)
 	maxTutorDepth := int(StockfishBoss)
 	weakDepth := max1(0, currentTutorDepth-5)
+	atomic.StoreInt32(&currentTutorDepthAtomic, int32(currentTutorDepth))
+	atomic.StoreInt32(&weakDepthAtomic, int32(weakDepth))
 
 	bestElo := 400
 	startBatch := 0
@@ -397,6 +405,8 @@ func main() {
 					weakDepth = cp.WeakDepth
 				}
 				weakDepth = max1(0, currentTutorDepth-5)
+				atomic.StoreInt32(&currentTutorDepthAtomic, int32(currentTutorDepth))
+				atomic.StoreInt32(&weakDepthAtomic, int32(weakDepth))
 				loadedFrom = bestPath
 			} else {
 				checkpointIncompatible = true
@@ -405,16 +415,19 @@ func main() {
 				startBatch = 0
 				currentTutorDepth = int(StockfishStandard)
 				weakDepth = max1(0, currentTutorDepth-5)
+				atomic.StoreInt32(&currentTutorDepthAtomic, int32(currentTutorDepth))
+				atomic.StoreInt32(&weakDepthAtomic, int32(weakDepth))
 			}
 		}
 	}
 
 	state := &TrainingState{
-		Batch:        startBatch,
-		TargetElo:    cfg.TargetElo,
-		CurrentElo:   bestElo,
-		StartTime:    time.Now(),
-		LastEloCheck: time.Now(),
+		Batch:         startBatch,
+		TargetElo:     cfg.TargetElo,
+		CurrentElo:    bestElo,
+		EloCheckEvery: cfg.EloCheckEvery,
+		StartTime:     time.Now(),
+		LastEloCheck:  time.Now(),
 	}
 
 	state.AddLog(fmt.Sprintf("Target ELO: %d", cfg.TargetElo))
@@ -466,11 +479,13 @@ func main() {
 	go func() {
 		<-sigCh
 		state.AddLog("Interrupt received — stopping after current batch.")
+		currentTutorDepthSnapshot := int(atomic.LoadInt32(&currentTutorDepthAtomic))
+		weakDepthSnapshot := int(atomic.LoadInt32(&weakDepthAtomic))
 		shutdownCP := TrainingCheckpoint{
 			Batch:      state.Batch,
 			BestElo:    bestElo,
-			TutorDepth: currentTutorDepth,
-			WeakDepth:  weakDepth,
+			TutorDepth: currentTutorDepthSnapshot,
+			WeakDepth:  weakDepthSnapshot,
 			Net:        net.Snapshot(),
 			SavedAt:    time.Now(),
 		}
@@ -658,6 +673,8 @@ func main() {
 				setStockfishPoolDepth(tutorPool, currentTutorDepth)
 				weakDepth = max1(0, currentTutorDepth-5)
 				setStockfishPoolDepth(weakPool, weakDepth)
+				atomic.StoreInt32(&currentTutorDepthAtomic, int32(currentTutorDepth))
+				atomic.StoreInt32(&weakDepthAtomic, int32(weakDepth))
 				state.AddLog(fmt.Sprintf("Tutor promotion: score %.0f%% (%d games) -> tutor depth %d, weak depth %d", score*100, tutorGames, currentTutorDepth, weakDepth))
 			}
 		}

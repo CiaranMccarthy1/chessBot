@@ -9,7 +9,7 @@ type GameResult float32
 
 const (
 	WhiteWin GameResult = 1.0
-	Draw     GameResult = 0.0
+	Draw     GameResult = -0.001
 	BlackWin GameResult = -1.0
 )
 
@@ -32,7 +32,7 @@ type GameRecord struct {
 // ── Self-play ─────────────────────────────────────────────────────────────────
 
 const maxGameMoves = 200
-const mctsSimulations = 50
+const mctsSimulations = 150
 const mctsRootDirichletAlpha = 0.30
 const mctsRootDirichletEps = 0.1
 

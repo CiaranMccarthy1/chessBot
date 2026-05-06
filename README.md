@@ -1,4 +1,4 @@
-# Go-Torch Chess Engine
+sto# Go-Torch Chess Engine
 
 An autonomous chess training system built on top of [go-torch](https://github.com/CiaranMccarthy1/go-torch), a custom deep learning framework written in Go. The bot trains itself without human interaction using a three-tier reinforcement learning pipeline — self-play, a standard Stockfish tutor, and a high-depth Stockfish boss — until it reaches a target ELO rating.
 
@@ -193,7 +193,7 @@ No other external dependencies. The Stockfish bridge uses Go's `os/exec` over st
 
 ## Limitations & next steps
 
-- **No weight serialisation** — weights live in memory only. Adding `encoding/gob` or a binary dump to disk would allow training to resume across sessions.
+- **Weight serialisation** — checkpoints are saved to disk via encoding/gob as checkpoints/latest.gob (every N batches) and checkpoints/best.gob (on ELO improvement or clean shutdown). Pass --new to ignore saved weights and start from random initialisation.
 - **No castling or en-passant** — the move generator omits both for simplicity. Adding them improves opening and tactical play significantly.
 - **FEN is simplified** — castling rights and en-passant square are omitted from generated FENs. This is fine for training position evaluation but means Stockfish may play slightly differently than it would in a full game.
 - **Fixed learning rate** — a cosine or step decay schedule would improve convergence at higher ELOs.

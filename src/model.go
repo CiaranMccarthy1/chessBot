@@ -449,12 +449,12 @@ func (n *AlphaNet) TrainStepJoint(
 
 			for i, m := range moves {
 				prob := exps[i] * invSum
-				target := float32(0)
+				policyTarget := float32(0)
 				if movePolicyIndex(m) == moveTargetIdx {
-					target = 1
+					policyTarget = 1
 					policyLoss += -float32(math.Log(float64(maxf(prob, 1e-8))))
 				}
-				g := policyWeight * (prob - target)
+				g := policyWeight * (prob - policyTarget)
 				fromGrad[m.FromR*8+m.FromC] += g
 				toGrad[m.ToR*8+m.ToC] += g
 				promoGrad[promoClass(m.Promo)] += g
@@ -530,12 +530,12 @@ func (n *AlphaNet) TrainMiniBatch(
 
 			for i, m := range moves {
 				prob := exps[i] * invSum
-				target := float32(0)
+				policyTarget := float32(0)
 				if movePolicyIndex(m) == s.TargetIndex {
-					target = 1
+					policyTarget = 1
 					policyLossSum += -float32(math.Log(float64(maxf(prob, 1e-8))))
 				}
-				g := policyWeight * (prob - target) * invN
+				g := policyWeight * (prob - policyTarget) * invN
 				fromGrad[m.FromR*8+m.FromC] += g
 				toGrad[m.ToR*8+m.ToC] += g
 				promoGrad[promoClass(m.Promo)] += g
