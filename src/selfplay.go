@@ -32,7 +32,7 @@ type GameRecord struct {
 // ── Self-play ─────────────────────────────────────────────────────────────────
 
 const maxGameMoves = 200
-const mctsSimulations = 150
+const mctsSimulations = 350
 const mctsRootDirichletAlpha = 0.30
 const mctsRootDirichletEps = 0.1
 
@@ -178,6 +178,96 @@ func PlaySelf(net *AlphaNet, rng *rand.Rand, cfg ExploreConfig) GameRecord {
 }
 
 // ── Stockfish game ────────────────────────────────────────────────────────────
+
+// GenerateStockfishSelfPlayGame plays a full game between two Stockfish engines.
+// White uses sf1, Black uses sf2.
+func GenerateStockfishSelfPlayGame(sf1, sf2 *StockfishEngine, rng *rand.Rand) GameRecord {
+	b := StartPos()
+	turn := White
+	var record GameRecord
+	halfMoveClock := 0
+	repetition := map[string]int{BoardToFEN(b, turn): 1}
+
+	for move := 0; move < maxGameMoves; move++ {
+		moves := LegalMoves(b, turn)
+		if len(moves) == 0 {
+			if IsInCheck(b, turn) {
+				if turn == White {
+					record.Result = BlackWin
+				} else {
+					record.Result = WhiteWin
+				}
+			} else {
+				record.Result = Draw
+			}
+			break
+		}
+
+		sf := sf1
+		if turn == Black {
+			sf = sf2
+		}
+
+		var m Move
+		fen := BoardToFEN(b, turn)
+		uciMove, err := sf.BestMove(fen)
+		if err != nil || uciMove == "" {
+			if rng != nil {
+				m = moves[rng.Intn(len(moves))]
+			} else {
+				m = moves[rand.Intn(len(moves))]
+			}
+		} else {
+			var ok bool
+			m, ok = ParseUCI(uciMove, b, turn)
+			if !ok {
+				if rng != nil {
+					m = moves[rng.Intn(len(moves))]
+				} else {
+					m = moves[rand.Intn(len(moves))]
+				}
+			}
+		}
+
+		targetIdx := movePolicyIndex(m)
+		record.Samples = append(record.Samples, PositionSample{
+			Board:       b,
+			Turn:        turn,
+			TargetIndex: targetIdx,
+		})
+
+		halfMoveClock = updateHalfMoveClock(b, m, halfMoveClock)
+		b = ApplyMove(b, m)
+		turn = turn.Flip()
+
+		if halfMoveClock >= 100 {
+			record.Result = Draw
+			break
+		}
+
+		posKey := BoardToFEN(b, turn)
+		repetition[posKey]++
+		if repetition[posKey] >= 3 {
+			record.Result = Draw
+			break
+		}
+
+		if move == maxGameMoves-1 {
+			record.Result = Draw
+		}
+	}
+
+	for i := range record.Samples {
+		s := &record.Samples[i]
+		r := float32(record.Result)
+		if s.Turn == Black {
+			r = -r
+		}
+		s.Result = r
+	}
+
+	return record
+}
 
 // PlayVsStockfish plays one game where our net plays White, Stockfish plays Black.
 // opponentColor controls which colour Stockfish takes.

@@ -35,6 +35,13 @@ type TrainConfig struct {
 	WeakRatio       float64
 	AdaptiveMix     bool
 
+	PretrainDepth        int
+	PretrainBatches      int
+	PretrainPolicyWeight float32
+	PretrainValueWeight  float32
+	PolicySwitchLoss     float32
+	PolicySwitchWindow   int
+
 	MiniBatchSize    int
 	UpdatesPerBatch  int
 	ReplayCapacity   int
@@ -52,6 +59,13 @@ type TrainConfig struct {
 	// Ratios should sum to 1.0
 }
 
+type TrainMode int
+
+const (
+	ModePretrain TrainMode = iota
+	ModeRL
+)
+
 func defaultConfig() TrainConfig {
 	return TrainConfig{
 		TargetElo:       1200,
@@ -60,11 +74,18 @@ func defaultConfig() TrainConfig {
 		EloCheckEvery:   5,
 		EloGamesPerTier: 16,
 		Workers:         8,
-		SelfPlayRatio:   0.40,
-		TutorRatio:      0.40,
-		BossRatio:       0.05,
-		WeakRatio:       0.15,
+		SelfPlayRatio:   0.625,
+		TutorRatio:      0.2083333333,
+		BossRatio:       0.0416666667,
+		WeakRatio:       0.125,
 		AdaptiveMix:     false,
+
+		PretrainDepth:        4,
+		PretrainBatches:      300,
+		PretrainPolicyWeight: 1.0,
+		PretrainValueWeight:  0.2,
+		PolicySwitchLoss:     1.5,
+		PolicySwitchWindow:   10,
 
 		MiniBatchSize:    128,
 		UpdatesPerBatch:  8,
@@ -72,7 +93,7 @@ func defaultConfig() TrainConfig {
 		MinReplayToTrain: 2000,
 
 		ValueLossWeight:  1.0,
-		PolicyLossWeight: 1.0,
+		PolicyLossWeight: 0.3,
 		WeightDecay:      1e-5,
 		GradClipNorm:     2.0,
 
@@ -98,27 +119,29 @@ const (
 )
 
 type TrainingState struct {
-	mu            sync.Mutex
-	Batch         int
-	TotalGames    int
-	CurrentElo    int
-	TargetElo     int
-	EloCheckEvery int
-	AvgLoss       float32
-	AvgValueLoss  float32
-	AvgPolicyLoss float32
-	ReplaySize    int
-	SelfWins      int
-	TutorWins     int
-	BossWins      int
-	WeakWins      int
-	SelfLosses    int
-	TutorLosses   int
-	BossLosses    int
-	WeakLosses    int
-	Log           []string
-	StartTime     time.Time
-	LastEloCheck  time.Time
+	mu                   sync.Mutex
+	Batch                int
+	TotalGames           int
+	CurrentElo           int
+	TargetElo            int
+	EloCheckEvery        int
+	Mode                 string
+	PretrainCurrentDepth int
+	AvgLoss              float32
+	AvgValueLoss         float32
+	AvgPolicyLoss        float32
+	ReplaySize           int
+	SelfWins             int
+	TutorWins            int
+	BossWins             int
+	WeakWins             int
+	SelfLosses           int
+	TutorLosses          int
+	BossLosses           int
+	WeakLosses           int
+	Log                  []string
+	StartTime            time.Time
+	LastEloCheck         time.Time
 }
 
 func (s *TrainingState) AddLog(msg string) {
@@ -174,6 +197,10 @@ func render(s *TrainingState) {
 		pct)
 
 	// Stats row
+	fmt.Printf("  %sMode%s  %-8s", gray, reset, s.Mode)
+	if s.Mode == "PRETRAIN" && s.PretrainCurrentDepth > 0 {
+		fmt.Printf("  %sDepth%s %-2d", gray, reset, s.PretrainCurrentDepth)
+	}
 	fmt.Printf("  %sBatch%s  %-6d  %sGames%s  %-6d  %sReplay%s  %-6d  %sUptime%s  %s\n",
 		gray, reset, s.Batch,
 		gray, reset, s.TotalGames,
@@ -359,16 +386,28 @@ func setStockfishPoolDepth(pool []*StockfishEngine, depth int) {
 func main() {
 	cfg := defaultConfig()
 	startFresh := false
+	mode := ModeRL
 
 	// Parse optional CLI args:
-	//   --new         start from scratch (ignore saved best checkpoint)
-	//   <number>      target ELO
-	for _, arg := range os.Args[1:] {
+	//   --new               start from scratch (ignore saved best checkpoint)
+	//   --pretrain [batches] enable pretraining (optional batch count)
+	//   <number>            target ELO
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
 		switch arg {
 		case "--new":
 			startFresh = true
+		case "--pretrain":
+			mode = ModePretrain
+			if i+1 < len(args) {
+				if n, err := strconv.Atoi(args[i+1]); err == nil {
+					cfg.PretrainBatches = n
+					i++
+				}
+			}
 		case "-h", "--help":
-			fmt.Println("Usage: go run ./src [--new] [target_elo]")
+			fmt.Println("Usage: go run ./src [--new] [--pretrain [batches]] [target_elo]")
 			return
 		default:
 			if n, err := strconv.Atoi(arg); err == nil {
@@ -381,11 +420,18 @@ func main() {
 	net := NewAlphaNet(rng)
 	replay := NewReplayBuffer(cfg.ReplayCapacity)
 	bestPath := filepath.Join(filepath.Dir(cfg.CheckpointPath), "best.gob")
+	valueLossWeight := cfg.ValueLossWeight
+	policyLossWeight := cfg.PolicyLossWeight
+	pretrainDepth := cfg.PretrainDepth
+	pretrainDepth = max1(1, pretrainDepth)
+	pretrainBatchesDone := 0
+	pretrainBelowThreshold := 0
+	policySwitchWindow := max1(cfg.PolicySwitchWindow, 1)
 	var currentTutorDepthAtomic int32
 	var weakDepthAtomic int32
-	currentTutorDepth := int(StockfishStandard)
+	currentTutorDepth := 1
 	maxTutorDepth := int(StockfishBoss)
-	weakDepth := max1(0, currentTutorDepth-5)
+	weakDepth := max1(1, currentTutorDepth/2)
 	atomic.StoreInt32(&currentTutorDepthAtomic, int32(currentTutorDepth))
 	atomic.StoreInt32(&weakDepthAtomic, int32(weakDepth))
 
@@ -398,13 +444,12 @@ func main() {
 			if net.LoadSnapshot(cp.Net) {
 				bestElo = cp.BestElo
 				startBatch = cp.Batch
-				if cp.TutorDepth > 0 {
+				if cp.TutorDepth > 0 && cp.TutorDepth != int(StockfishStandard) {
 					currentTutorDepth = cp.TutorDepth
+				} else {
+					currentTutorDepth = 1
 				}
-				if cp.WeakDepth >= 0 {
-					weakDepth = cp.WeakDepth
-				}
-				weakDepth = max1(0, currentTutorDepth-5)
+				weakDepth = max1(1, currentTutorDepth/2)
 				atomic.StoreInt32(&currentTutorDepthAtomic, int32(currentTutorDepth))
 				atomic.StoreInt32(&weakDepthAtomic, int32(weakDepth))
 				loadedFrom = bestPath
@@ -413,8 +458,8 @@ func main() {
 				net = NewAlphaNet(rng)
 				bestElo = 400
 				startBatch = 0
-				currentTutorDepth = int(StockfishStandard)
-				weakDepth = max1(0, currentTutorDepth-5)
+				currentTutorDepth = 1
+				weakDepth = max1(1, currentTutorDepth/2)
 				atomic.StoreInt32(&currentTutorDepthAtomic, int32(currentTutorDepth))
 				atomic.StoreInt32(&weakDepthAtomic, int32(weakDepth))
 			}
@@ -422,12 +467,18 @@ func main() {
 	}
 
 	state := &TrainingState{
-		Batch:         startBatch,
-		TargetElo:     cfg.TargetElo,
-		CurrentElo:    bestElo,
-		EloCheckEvery: cfg.EloCheckEvery,
-		StartTime:     time.Now(),
-		LastEloCheck:  time.Now(),
+		Batch:                startBatch,
+		TargetElo:            cfg.TargetElo,
+		CurrentElo:           bestElo,
+		EloCheckEvery:        cfg.EloCheckEvery,
+		Mode:                 "RL",
+		PretrainCurrentDepth: 0,
+		StartTime:            time.Now(),
+		LastEloCheck:         time.Now(),
+	}
+	if mode == ModePretrain {
+		state.Mode = "PRETRAIN"
+		state.PretrainCurrentDepth = pretrainDepth
 	}
 
 	state.AddLog(fmt.Sprintf("Target ELO: %d", cfg.TargetElo))
@@ -473,12 +524,32 @@ func main() {
 
 	state.AddLog(fmt.Sprintf("Stockfish engine pools ready (%d each, T/W depth: %d/%d).", poolSize, currentTutorDepth, weakDepth))
 
+	var pretrainPool []*StockfishEngine
+	var pretrainCh chan *StockfishEngine
+	pretrainPoolSize := max1(cfg.Workers, 2)
+	if mode == ModePretrain {
+		pretrainPool, pretrainCh, err = newStockfishPool(pretrainPoolSize, pretrainDepth)
+		if err != nil {
+			closeStockfishPool(tutorPool)
+			closeStockfishPool(bossPool)
+			closeStockfishPool(weakPool)
+			fmt.Fprintf(os.Stderr, "stockfish pretrain init failed: %v\n", err)
+			os.Exit(1)
+		}
+		state.AddLog(fmt.Sprintf("Pretrain pool ready (%d each, depth %d).", pretrainPoolSize, pretrainDepth))
+	}
+
 	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
 		state.AddLog("Interrupt received — stopping after current batch.")
+		if pretrainPool != nil {
+			closeStockfishPool(pretrainPool)
+			pretrainPool = nil
+			pretrainCh = nil
+		}
 		currentTutorDepthSnapshot := int(atomic.LoadInt32(&currentTutorDepthAtomic))
 		weakDepthSnapshot := int(atomic.LoadInt32(&weakDepthAtomic))
 		shutdownCP := TrainingCheckpoint{
@@ -526,6 +597,150 @@ func main() {
 		state.Batch = batch
 		state.mu.Unlock()
 
+		if mode == ModePretrain {
+			pretrainBatchesDone++
+			state.AddLog(fmt.Sprintf("Pretrain batch %d/%d — generating %d SF games at depth %d", pretrainBatchesDone, cfg.PretrainBatches, cfg.BatchSize, pretrainDepth))
+			render(state)
+
+			var (
+				recordsMu  sync.Mutex
+				allRecords []GameRecord
+				wg         sync.WaitGroup
+				moveCount  int
+			)
+
+			jobs := make(chan struct{}, cfg.BatchSize)
+			for i := 0; i < cfg.BatchSize; i++ {
+				jobs <- struct{}{}
+			}
+			close(jobs)
+
+			for w := 0; w < cfg.Workers; w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					workerRNG := newRNG()
+					for range jobs {
+						sf1 := <-pretrainCh
+						sf2 := <-pretrainCh
+						rec := GenerateStockfishSelfPlayGame(sf1, sf2, workerRNG)
+						pretrainCh <- sf1
+						pretrainCh <- sf2
+						recordsMu.Lock()
+						allRecords = append(allRecords, rec)
+						moveCount += len(rec.Samples)
+						recordsMu.Unlock()
+					}
+				}()
+			}
+			wg.Wait()
+
+			if len(allRecords) > 0 {
+				avgMoves := float64(moveCount) / float64(len(allRecords))
+				state.AddLog(fmt.Sprintf("Avg game length: %.1f moves", avgMoves))
+			}
+
+			state.mu.Lock()
+			state.TotalGames += len(allRecords)
+			state.mu.Unlock()
+
+			state.AddLog(fmt.Sprintf("Batch %d — pretraining on positions...", batch))
+			render(state)
+
+			var allSamples []PositionSample
+			for _, rec := range allRecords {
+				allSamples = append(allSamples, rec.Samples...)
+			}
+			replay.Add(allSamples)
+
+			state.mu.Lock()
+			state.ReplaySize = replay.Len()
+			state.mu.Unlock()
+
+			policyLossAvg := float32(0)
+			if replay.Len() < cfg.MinReplayToTrain {
+				state.AddLog(fmt.Sprintf("Replay warmup: %d/%d samples", replay.Len(), cfg.MinReplayToTrain))
+				render(state)
+			} else {
+				var totalLoss float32
+				var valueLoss float32
+				var policyLoss float32
+				var nSamples int
+				for u := 0; u < cfg.UpdatesPerBatch; u++ {
+					mb := replay.Sample(cfg.MiniBatchSize, batchRNG)
+					if len(mb) == 0 {
+						continue
+					}
+					vl, pl, tl := net.TrainMiniBatch(
+						mb,
+						cfg.LearningRate,
+						cfg.PretrainValueWeight,
+						cfg.PretrainPolicyWeight,
+						cfg.WeightDecay,
+						cfg.GradClipNorm,
+					)
+					valueLoss += vl
+					policyLoss += pl
+					totalLoss += tl
+					nSamples += len(mb)
+				}
+
+				den := float32(max1(cfg.UpdatesPerBatch, 1))
+				policyLossAvg = policyLoss / den
+				state.mu.Lock()
+				state.AvgLoss = totalLoss / den
+				state.AvgValueLoss = valueLoss / den
+				state.AvgPolicyLoss = policyLossAvg
+				state.mu.Unlock()
+
+				state.AddLog(fmt.Sprintf("Batch %d done — %d samples, loss=%.4f (v=%.4f p=%.4f)",
+					batch, nSamples, totalLoss/den, valueLoss/den, policyLossAvg))
+			}
+
+			if policyLossAvg > 0 {
+				desiredDepth := pretrainDepthForPolicyLoss(policyLossAvg)
+				if desiredDepth != pretrainDepth {
+					closeStockfishPool(pretrainPool)
+					pretrainPool, pretrainCh, err = newStockfishPool(pretrainPoolSize, desiredDepth)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "stockfish pretrain reinit failed: %v\n", err)
+						os.Exit(1)
+					}
+					pretrainDepth = desiredDepth
+					state.mu.Lock()
+					state.PretrainCurrentDepth = pretrainDepth
+					state.mu.Unlock()
+					state.AddLog(fmt.Sprintf("Pretrain depth -> %d (policy loss %.2f)", pretrainDepth, policyLossAvg))
+				}
+			}
+
+			if policyLossAvg > 0 && policyLossAvg < cfg.PolicySwitchLoss {
+				pretrainBelowThreshold++
+			} else {
+				pretrainBelowThreshold = 0
+			}
+
+			if pretrainBelowThreshold >= policySwitchWindow || pretrainBatchesDone >= cfg.PretrainBatches {
+				mode = ModeRL
+				valueLossWeight = 1.0
+				policyLossWeight = 0.5
+				pretrainBelowThreshold = 0
+				if pretrainPool != nil {
+					closeStockfishPool(pretrainPool)
+					pretrainPool = nil
+					pretrainCh = nil
+				}
+				state.mu.Lock()
+				state.Mode = "RL"
+				state.PretrainCurrentDepth = 0
+				state.mu.Unlock()
+				state.AddLog("Pretraining complete — switching to RL")
+			}
+
+			render(state)
+			continue
+		}
+
 		selfRatio, tutorRatio, bossRatio, weakRatio := adaptiveRatios(
 			batch,
 			cfg.ScheduleBatches,
@@ -564,6 +779,7 @@ func main() {
 			wg         sync.WaitGroup
 			tutorGames int
 			tutorScore float64
+			moveCount  int
 		)
 
 		// Worker pool — game generation
@@ -660,18 +876,24 @@ func main() {
 					}
 					recordsMu.Lock()
 					allRecords = append(allRecords, rec)
+					moveCount += len(rec.Samples)
 					recordsMu.Unlock()
 				}
 			}()
 		}
 		wg.Wait()
 
+		if len(allRecords) > 0 {
+			avgMoves := float64(moveCount) / float64(len(allRecords))
+			state.AddLog(fmt.Sprintf("Avg game length: %.1f moves", avgMoves))
+		}
+
 		if tutorGames > 0 {
 			score := tutorScore / float64(tutorGames)
-			if score >= 0.80 && currentTutorDepth < maxTutorDepth {
+			if score >= 0.85 && currentTutorDepth < maxTutorDepth {
 				currentTutorDepth++
 				setStockfishPoolDepth(tutorPool, currentTutorDepth)
-				weakDepth = max1(0, currentTutorDepth-5)
+				weakDepth = max1(1, currentTutorDepth/2)
 				setStockfishPoolDepth(weakPool, weakDepth)
 				atomic.StoreInt32(&currentTutorDepthAtomic, int32(currentTutorDepth))
 				atomic.StoreInt32(&weakDepthAtomic, int32(weakDepth))
@@ -715,8 +937,8 @@ func main() {
 				vl, pl, tl := net.TrainMiniBatch(
 					mb,
 					cfg.LearningRate,
-					cfg.ValueLossWeight,
-					cfg.PolicyLossWeight,
+					valueLossWeight,
+					policyLossWeight,
 					cfg.WeightDecay,
 					cfg.GradClipNorm,
 				)
@@ -812,4 +1034,17 @@ func max1(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func pretrainDepthForPolicyLoss(loss float32) int {
+	if loss > 3.0 {
+		return 2
+	}
+	if loss > 2.0 {
+		return 3
+	}
+	if loss >= 1.5 {
+		return 4
+	}
+	return 4
 }

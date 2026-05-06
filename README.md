@@ -1,6 +1,6 @@
 sto# Go-Torch Chess Engine
 
-An autonomous chess training system built on top of [go-torch](https://github.com/CiaranMccarthy1/go-torch), a custom deep learning framework written in Go. The bot trains itself without human interaction using a three-tier reinforcement learning pipeline — self-play, a standard Stockfish tutor, and a high-depth Stockfish boss — until it reaches a target ELO rating.
+An autonomous chess training system built on top of [go-torch](https://github.com/CiaranMccarthy1/go-torch), a custom deep learning framework written in Go. The bot now uses a two-phase pipeline: supervised pretraining from Stockfish self-play, then reinforcement learning with self-play plus weak/tutor/boss Stockfish tiers until it reaches a target ELO rating.
 
 ## Latest training result
 
@@ -71,27 +71,34 @@ The full input is flipped to the side-to-move's perspective before the forward p
 
 ## Training Pipeline
 
-### Three-tier opponent mix
+### RL opponent mix
 
 | Tier | Share | Opponent | Purpose |
 |------|-------|----------|---------|
-| Self-play | 50% | Another instance of AlphaNet | Balanced improvement; training partner scales with the bot |
-| Tutor | 40% | Stockfish depth 6 (~1700 ELO) | Consistent tactical baseline |
-| Boss | 10% | Stockfish depth 18 (~2500 ELO) | Stress-tests long-range threats; bakes deep calculation into static weights |
+| Self-play | 62.5% | Another instance of AlphaNet | Balanced improvement; training partner scales with the bot |
+| Tutor | 20.8% | Stockfish, starting at depth 1 | Tactical baseline; depth increases on strong results |
+| Boss | 4.2% | Stockfish depth 18 (~2500 ELO) | Stress-tests long-range threats; bakes deep calculation into static weights |
+| Weak | 12.5% | Stockfish at half tutor depth (min 1) | Early win signal and confidence building |
 
 ### Loop
 
 ```
 for each batch:
-    1. Spin up N worker goroutines
-    2. Each worker generates games according to the 50/40/10 split
-       - Self-play: AlphaNet vs AlphaNet (10% random exploration)
-       - Tutor/Boss: AlphaNet vs Stockfish via UCI, alternating colours
-    3. Collect all (board, side_to_move, game_result) samples
-    4. Shuffle samples across all games
-    5. Run TrainStep on each sample → forward → inject grad → Backward → SGD
-    6. Every N batches: probe ELO against tiered Stockfish opponents
-    7. Stop when estimated ELO >= target
+     1. If in pretraining mode:
+         - Generate Stockfish vs Stockfish games at the current pretraining depth
+         - Train with supervised policy targets (value weight low, policy weight high)
+         - Increase pretraining depth as policy loss improves
+         - Switch to RL after the configured number of batches or sustained low policy loss
+     2. If in RL mode:
+         - Spin up N worker goroutines
+         - Each worker generates games according to the S/T/B/W split
+         - Self-play: AlphaNet vs AlphaNet (exploration in openings)
+         - Tutor/Boss/Weak: AlphaNet vs Stockfish via UCI, alternating colours
+     3. Collect all (board, side_to_move, game_result) samples
+     4. Shuffle samples across all games
+     5. Run TrainMiniBatch updates on replay samples
+     6. Every N batches: probe ELO against tiered Stockfish opponents
+     7. Stop when estimated ELO >= target
 ```
 
 ### Concurrency
@@ -146,6 +153,15 @@ go run ./src
 # Train to default target from scratch (ignore checkpoints)
 go run ./src --new
 
+# Pretrain then switch to RL (default 300 pretrain batches)
+go run ./src --pretrain
+
+# Pretrain for a custom number of batches
+go run ./src --pretrain 500
+
+# Pretrain for a custom number of batches and set target ELO
+go run ./src --pretrain 300 1500
+
 # Train to a custom target
 go run ./src 1500
 
@@ -169,15 +185,25 @@ Edit the `defaultConfig()` function in `src/main.go`:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `TargetElo` | 1200 | ELO at which training stops |
-| `LearningRate` | 0.001 | SGD step size |
-| `BatchSize` | 20 | Games generated per training batch |
+| `LearningRate` | 0.0004 | Adam step size |
+| `BatchSize` | 24 | Games generated per training batch |
 | `EloCheckEvery` | 5 | Batches between ELO probes |
-| `EloGamesPerTier` | 4 | Games played per Stockfish tier during probe |
-| `Workers` | 4 | Concurrent game-generation goroutines |
-| `SelfPlayRatio` | 0.50 | Fraction of batch that is self-play |
-| `TutorRatio` | 0.40 | Fraction of batch vs standard Stockfish |
+| `EloGamesPerTier` | 16 | Games played per Stockfish tier during probe |
+| `Workers` | 8 | Concurrent game-generation goroutines |
+| `SelfPlayRatio` | 0.625 | Fraction of batch that is self-play |
+| `TutorRatio` | 0.2083 | Fraction of batch vs tutor Stockfish |
+| `BossRatio` | 0.0417 | Fraction of batch vs boss Stockfish |
+| `WeakRatio` | 0.125 | Fraction of batch vs weak Stockfish |
+| `ValueLossWeight` | 1.0 | Value loss weight during RL |
+| `PolicyLossWeight` | 0.3 | Policy loss weight during RL |
+| `PretrainDepth` | 4 | Stockfish depth for pretraining (both sides) |
+| `PretrainBatches` | 300 | Pretraining batches before switching to RL |
+| `PretrainPolicyWeight` | 1.0 | Policy loss weight during pretraining |
+| `PretrainValueWeight` | 0.2 | Value loss weight during pretraining |
+| `PolicySwitchLoss` | 1.5 | Policy loss threshold to switch to RL |
+| `PolicySwitchWindow` | 10 | Consecutive batches below threshold before switching |
 
-Boss ratio is implied: `1 - SelfPlayRatio - TutorRatio` (default 10%).
+Boss/weak ratios are explicit in config. Tutor depth starts at 1 and promotes upward; weak depth tracks half of tutor depth (min 1).
 
 ---
 
