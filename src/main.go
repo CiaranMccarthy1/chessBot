@@ -758,6 +758,10 @@ func main() {
 			elo := EstimateElo(net, cfg.EloGamesPerTier, func(msg string) {
 				state.AddLog(msg)
 				render(state)
+			}, func(partialElo int) {
+				state.mu.Lock()
+				state.CurrentElo = partialElo
+				state.mu.Unlock()
 			})
 
 			state.mu.Lock()

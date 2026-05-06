@@ -53,7 +53,7 @@ func EloFromScore(score float64) float64 {
 
 // EstimateElo plays gamesPerDepth games against each depth tier,
 // returns interpolated ELO estimate.
-func EstimateElo(net *AlphaNet, gamesPerDepth int, log func(string)) int {
+func EstimateElo(net *AlphaNet, gamesPerDepth int, log func(string), progress func(int)) int {
 	bestElo := 400 // floor
 	hitCeiling := false
 	evalExplore := ExploreConfig{
@@ -109,6 +109,10 @@ func EstimateElo(net *AlphaNet, gamesPerDepth int, log func(string)) int {
 		low, high := scoreCI95(score, total)
 		eloDiff := EloFromScore(score)
 		estimatedElo := int(float64(tier.elo) + eloDiff)
+
+		if progress != nil {
+			progress(estimatedElo)
+		}
 
 		log("")
 		log("  vs Stockfish depth " + itoa(tier.depth) + " (~" + itoa(tier.elo) + " ELO):")
