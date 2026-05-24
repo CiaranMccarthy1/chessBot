@@ -123,9 +123,22 @@ func BoardToTensor(b Board, turn Color) *gt.Tensor {
 
 	// From the perspective of the side to move
 	if turn == Black {
-		for i := range data {
-			data[i] = -data[i]
+		// Mirror piece values: flip board vertically and invert ownership signs
+		mirrored := make([]float32, 64)
+		for r := 0; r < 8; r++ {
+			for c := 0; c < 8; c++ {
+				mirrored[(7-r)*8+c] = -data[r*8+c]
+			}
 		}
+		copy(data[:64], mirrored)
+		// Mirror mobility channel the same way
+		mirroredMob := make([]float32, 64)
+		for r := 0; r < 8; r++ {
+			for c := 0; c < 8; c++ {
+				mirroredMob[(7-r)*8+c] = -data[64+r*8+c]
+			}
+		}
+		copy(data[64:], mirroredMob)
 	}
 
 	return gt.NewTensor(data, []int{1, 128}, false)
@@ -135,10 +148,10 @@ func BoardToTensor(b Board, turn Color) *gt.Tensor {
 
 const (
 	InputDim             = 128
-	HiddenDim            = 64
-	HiddenDim2           = 64
+	HiddenDim            = 256
+	HiddenDim2           = 256
 	PromoClasses         = 5 // none, knight, bishop, rook, queen
-	NetCheckpointVersion = 1
+	NetCheckpointVersion = 2
 )
 
 // AlphaNet is a single network with one value head and factorized move-policy heads.
@@ -217,9 +230,12 @@ func (n *AlphaNet) Forward(b Board, turn Color) (float32, []float32, []float32, 
 	h1 := gt.ReLU(gt.MatMul(x, n.W1))  // [1, 64]
 	h2 := gt.ReLU(gt.MatMul(h1, n.W2)) // [1, 64]
 	vOut := gt.MatMul(h2, n.Wv)        // [1, 1]
-	pfOut := gt.MatMul(h2, n.Wpf)      // [1, 64]
-	ptOut := gt.MatMul(h2, n.Wpt)      // [1, 64]
-	ppOut := gt.MatMul(h2, n.Wpp)      // [1, 5]
+	if len(vOut.Data) > 0 {
+		vOut.Data[0] = float32(math.Tanh(float64(vOut.Data[0])))
+	}
+	pfOut := gt.MatMul(h2, n.Wpf) // [1, 64]
+	ptOut := gt.MatMul(h2, n.Wpt) // [1, 64]
+	ppOut := gt.MatMul(h2, n.Wpp) // [1, 5]
 	return vOut.Data[0], pfOut.Data, ptOut.Data, ppOut.Data, vOut, pfOut, ptOut, ppOut
 }
 
@@ -379,16 +395,14 @@ func promoClass(pt PieceType) int {
 }
 
 func movePolicyIndex(m Move) int {
-	from := m.FromR*8 + m.FromC
-	to := m.ToR*8 + m.ToC
-	return ((from*64)+to)*PromoClasses + promoClass(m.Promo)
+	return m.ToR*8 + m.ToC
 }
 
 func moveLogitFromHeads(m Move, fromLogits []float32, toLogits []float32, promoLogits []float32) float32 {
 	from := m.FromR*8 + m.FromC
 	to := m.ToR*8 + m.ToC
 	pc := promoClass(m.Promo)
-	return fromLogits[from] + toLogits[to] + promoLogits[pc]
+	return 0.3*fromLogits[from] + toLogits[to] + promoLogits[pc]
 }
 
 // TrainStep runs one forward→backward→SGD cycle.
@@ -414,7 +428,8 @@ func (n *AlphaNet) TrainStepJoint(
 	score, fromLogits, toLogits, promoLogits, vOut, pfOut, ptOut, ppOut := n.Forward(b, turn)
 
 	valueLoss := (score - valueTarget) * (score - valueTarget)
-	vOut.Grad = []float32{valueWeight * 2 * (score - valueTarget)}
+	tanhGrad := float32(1 - score*score)
+	vOut.Grad = []float32{valueWeight * 2 * (score - valueTarget) * tanhGrad}
 	vOut.Backward()
 
 	policyLoss := float32(0)
@@ -447,17 +462,32 @@ func (n *AlphaNet) TrainStepJoint(
 			toGrad := make([]float32, 64)
 			promoGrad := make([]float32, PromoClasses)
 
+			fromTargetIdx := -1
+			if moveTargetIdx >= 0 {
+				for _, m := range moves {
+					if m.ToR*8+m.ToC == moveTargetIdx {
+						fromTargetIdx = m.FromR*8 + m.FromC
+						break
+					}
+				}
+			}
+
 			for i, m := range moves {
 				prob := exps[i] * invSum
-				policyTarget := float32(0)
-				if movePolicyIndex(m) == moveTargetIdx {
-					policyTarget = 1
+				toTarget := float32(0)
+				fromTarget := float32(0)
+				if m.ToR*8+m.ToC == moveTargetIdx {
+					toTarget = 1
 					policyLoss += -float32(math.Log(float64(maxf(prob, 1e-8))))
 				}
-				g := policyWeight * (prob - policyTarget)
-				fromGrad[m.FromR*8+m.FromC] += g
-				toGrad[m.ToR*8+m.ToC] += g
-				promoGrad[promoClass(m.Promo)] += g
+				if fromTargetIdx >= 0 && m.FromR*8+m.FromC == fromTargetIdx {
+					fromTarget = 1
+				}
+				gTo := policyWeight * (prob - toTarget)
+				gFrom := policyWeight * (prob - fromTarget)
+				fromGrad[m.FromR*8+m.FromC] += gFrom
+				toGrad[m.ToR*8+m.ToC] += gTo
+				promoGrad[promoClass(m.Promo)] += gTo
 			}
 
 			pfOut.Grad = fromGrad
@@ -497,7 +527,8 @@ func (n *AlphaNet) TrainMiniBatch(
 		score, fromLogits, toLogits, promoLogits, vOut, pfOut, ptOut, ppOut := n.Forward(s.Board, s.Turn)
 		valueLoss := (score - s.Result) * (score - s.Result)
 		valueLossSum += valueLoss
-		vOut.Grad = []float32{valueWeight * 2 * (score - s.Result) * invN}
+		tanhGrad := float32(1 - score*score)
+		vOut.Grad = []float32{valueWeight * 2 * (score - s.Result) * tanhGrad * invN}
 		vOut.Backward()
 
 		moves := LegalMoves(s.Board, s.Turn)
@@ -530,15 +561,20 @@ func (n *AlphaNet) TrainMiniBatch(
 
 			for i, m := range moves {
 				prob := exps[i] * invSum
-				policyTarget := float32(0)
-				if movePolicyIndex(m) == s.TargetIndex {
-					policyTarget = 1
+				toTarget := float32(0)
+				fromTarget := float32(0)
+				if m.ToR*8+m.ToC == s.TargetIndex {
+					toTarget = 1
 					policyLossSum += -float32(math.Log(float64(maxf(prob, 1e-8))))
 				}
-				g := policyWeight * (prob - policyTarget) * invN
-				fromGrad[m.FromR*8+m.FromC] += g
-				toGrad[m.ToR*8+m.ToC] += g
-				promoGrad[promoClass(m.Promo)] += g
+				if m.FromR*8+m.FromC == s.FromSquare {
+					fromTarget = 1
+				}
+				gTo := policyWeight * (prob - toTarget) * invN
+				gFrom := policyWeight * (prob - fromTarget) * invN
+				fromGrad[m.FromR*8+m.FromC] += gFrom
+				toGrad[m.ToR*8+m.ToC] += gTo
+				promoGrad[promoClass(m.Promo)] += gTo
 			}
 
 			pfOut.Grad = fromGrad
@@ -816,7 +852,7 @@ func (n *AlphaNet) SelectMoveMCTSWithPolicy(
 		node := root
 
 		for !node.terminal && node.unexpanded == 0 {
-			bestIdx := 0
+			bestIdx := -1
 			bestScore := float32(-1e9)
 			sqrtParent := float32(math.Sqrt(float64(maxf(float32(node.visits), 1))))
 			for i := range node.moves {
@@ -835,6 +871,9 @@ func (n *AlphaNet) SelectMoveMCTSWithPolicy(
 					bestScore = score
 					bestIdx = i
 				}
+			}
+			if bestIdx == -1 {
+				break
 			}
 			node = node.children[bestIdx]
 		}

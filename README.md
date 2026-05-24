@@ -85,9 +85,9 @@ The full input is flipped to the side-to-move's perspective before the forward p
 ```
 for each batch:
      1. If in pretraining mode:
-         - Generate Stockfish vs Stockfish games at the current pretraining depth
+         - Generate Stockfish vs Stockfish games at the current pretraining depths (White/Black)
          - Train with supervised policy targets (value weight low, policy weight high)
-         - Increase pretraining depth as policy loss improves
+         - Nudge both depths by +/-1 each batch with an upward bias toward start+5
          - Switch to RL after the configured number of batches or sustained low policy loss
      2. If in RL mode:
          - Spin up N worker goroutines
@@ -153,7 +153,7 @@ go run ./src
 # Train to default target from scratch (ignore checkpoints)
 go run ./src --new
 
-# Pretrain then switch to RL (default 300 pretrain batches)
+# Pretrain then switch to RL (default 400 pretrain batches)
 go run ./src --pretrain
 
 # Pretrain for a custom number of batches
@@ -196,8 +196,10 @@ Edit the `defaultConfig()` function in `src/main.go`:
 | `WeakRatio` | 0.125 | Fraction of batch vs weak Stockfish |
 | `ValueLossWeight` | 1.0 | Value loss weight during RL |
 | `PolicyLossWeight` | 0.3 | Policy loss weight during RL |
-| `PretrainDepth` | 4 | Stockfish depth for pretraining (both sides) |
-| `PretrainBatches` | 300 | Pretraining batches before switching to RL |
+| `PretrainDepth` | 5 | Stockfish depth for pretraining (fallback for both sides) |
+| `PretrainDepthWhite` | 5 | Stockfish depth for pretraining (White) |
+| `PretrainDepthBlack` | 5 | Stockfish depth for pretraining (Black) |
+| `PretrainBatches` | 400 | Pretraining batches before switching to RL |
 | `PretrainPolicyWeight` | 1.0 | Policy loss weight during pretraining |
 | `PretrainValueWeight` | 0.2 | Value loss weight during pretraining |
 | `PolicySwitchLoss` | 1.5 | Policy loss threshold to switch to RL |

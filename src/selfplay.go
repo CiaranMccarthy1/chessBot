@@ -9,7 +9,7 @@ type GameResult float32
 
 const (
 	WhiteWin GameResult = 1.0
-	Draw     GameResult = -0.001
+	Draw     GameResult = 0.0
 	BlackWin GameResult = -1.0
 )
 
@@ -20,7 +20,8 @@ type PositionSample struct {
 	Turn        Color       // whose turn it was at this position
 	Result      float32     // +1 if that side eventually won, -1 if lost, 0 draw
 	Policy      [64]float32 // optional destination-square summary (not primary policy target)
-	TargetIndex int         // full move target index (from/to/promo encoded)
+	TargetIndex int         // to-square index (0..63)
+	FromSquare  int         // from-square index (0..63)
 }
 
 // GameRecord holds all positions from one game.
@@ -32,9 +33,9 @@ type GameRecord struct {
 // ── Self-play ─────────────────────────────────────────────────────────────────
 
 const maxGameMoves = 200
-const mctsSimulations = 350
+const mctsSimulations = 1000
 const mctsRootDirichletAlpha = 0.30
-const mctsRootDirichletEps = 0.1
+const mctsRootDirichletEps = 0.25
 
 type ExploreConfig struct {
 	SelfExploreStart float32
@@ -48,12 +49,12 @@ type ExploreConfig struct {
 }
 
 var defaultExploreConfig = ExploreConfig{
-	SelfExploreStart: 0.10,
+	SelfExploreStart: 0.05,
 	SelfExploreEnd:   0.02,
 	VsExploreStart:   0.05,
 	VsExploreEnd:     0.01,
 	OpeningPly:       12,
-	OpeningTemp:      1.15,
+	OpeningTemp:      0.9,
 	CurrentBatch:     1,
 	TotalBatches:     2000,
 }
@@ -134,12 +135,12 @@ func PlaySelf(net *AlphaNet, rng *rand.Rand, cfg ExploreConfig) GameRecord {
 			)
 		}
 
-		targetIdx := movePolicyIndex(m)
 		record.Samples = append(record.Samples, PositionSample{
 			Board:       b,
 			Turn:        turn,
 			Policy:      policy,
-			TargetIndex: targetIdx,
+			TargetIndex: m.ToR*8 + m.ToC,
+			FromSquare:  m.FromR*8 + m.FromC,
 		})
 
 		halfMoveClock = updateHalfMoveClock(b, m, halfMoveClock)
@@ -229,11 +230,11 @@ func GenerateStockfishSelfPlayGame(sf1, sf2 *StockfishEngine, rng *rand.Rand) Ga
 			}
 		}
 
-		targetIdx := movePolicyIndex(m)
 		record.Samples = append(record.Samples, PositionSample{
 			Board:       b,
 			Turn:        turn,
-			TargetIndex: targetIdx,
+			TargetIndex: m.ToR*8 + m.ToC,
+			FromSquare:  m.FromR*8 + m.FromC,
 		})
 
 		halfMoveClock = updateHalfMoveClock(b, m, halfMoveClock)
@@ -334,12 +335,12 @@ func PlayVsStockfish(net *AlphaNet, sf *StockfishEngine, opponentColor Color, rn
 			policy = oneHotPolicy(m.ToR*8 + m.ToC)
 		}
 
-		targetIdx := movePolicyIndex(m)
 		record.Samples = append(record.Samples, PositionSample{
 			Board:       b,
 			Turn:        turn,
 			Policy:      policy,
-			TargetIndex: targetIdx,
+			TargetIndex: m.ToR*8 + m.ToC,
+			FromSquare:  m.FromR*8 + m.FromC,
 		})
 
 		halfMoveClock = updateHalfMoveClock(b, m, halfMoveClock)

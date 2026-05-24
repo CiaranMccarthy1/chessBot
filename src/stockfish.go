@@ -189,7 +189,7 @@ var pieceChar = map[Piece]byte{
 }
 
 // BoardToFEN converts a board + turn to a minimal FEN string.
-// Castling and en-passant are omitted for simplicity (training only).
+// Castling is defaulted to KQkq; en-passant is omitted.
 func BoardToFEN(b Board, turn Color) string {
 	var sb strings.Builder
 	for r := 0; r < 8; r++ {
@@ -214,9 +214,9 @@ func BoardToFEN(b Board, turn Color) string {
 		}
 	}
 	if turn == White {
-		sb.WriteString(" w - - 0 1")
+		sb.WriteString(" w KQkq - 0 1")
 	} else {
-		sb.WriteString(" b - - 0 1")
+		sb.WriteString(" b KQkq - 0 1")
 	}
 	return sb.String()
 }

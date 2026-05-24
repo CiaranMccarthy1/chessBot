@@ -36,6 +36,8 @@ type TrainConfig struct {
 	AdaptiveMix     bool
 
 	PretrainDepth        int
+	PretrainDepthWhite   int
+	PretrainDepthBlack   int
 	PretrainBatches      int
 	PretrainPolicyWeight float32
 	PretrainValueWeight  float32
@@ -72,7 +74,7 @@ func defaultConfig() TrainConfig {
 		LearningRate:    0.0004,
 		BatchSize:       24,
 		EloCheckEvery:   5,
-		EloGamesPerTier: 16,
+		EloGamesPerTier: 40,
 		Workers:         8,
 		SelfPlayRatio:   0.625,
 		TutorRatio:      0.2083333333,
@@ -80,8 +82,10 @@ func defaultConfig() TrainConfig {
 		WeakRatio:       0.125,
 		AdaptiveMix:     false,
 
-		PretrainDepth:        4,
-		PretrainBatches:      300,
+		PretrainDepth:        2,
+		PretrainDepthWhite:   2,
+		PretrainDepthBlack:   3,
+		PretrainBatches:      400,
 		PretrainPolicyWeight: 1.0,
 		PretrainValueWeight:  0.2,
 		PolicySwitchLoss:     1.5,
@@ -119,29 +123,30 @@ const (
 )
 
 type TrainingState struct {
-	mu                   sync.Mutex
-	Batch                int
-	TotalGames           int
-	CurrentElo           int
-	TargetElo            int
-	EloCheckEvery        int
-	Mode                 string
-	PretrainCurrentDepth int
-	AvgLoss              float32
-	AvgValueLoss         float32
-	AvgPolicyLoss        float32
-	ReplaySize           int
-	SelfWins             int
-	TutorWins            int
-	BossWins             int
-	WeakWins             int
-	SelfLosses           int
-	TutorLosses          int
-	BossLosses           int
-	WeakLosses           int
-	Log                  []string
-	StartTime            time.Time
-	LastEloCheck         time.Time
+	mu                 sync.Mutex
+	Batch              int
+	TotalGames         int
+	CurrentElo         int
+	TargetElo          int
+	EloCheckEvery      int
+	Mode               string
+	PretrainDepthWhite int
+	PretrainDepthBlack int
+	AvgLoss            float32
+	AvgValueLoss       float32
+	AvgPolicyLoss      float32
+	ReplaySize         int
+	SelfWins           int
+	TutorWins          int
+	BossWins           int
+	WeakWins           int
+	SelfLosses         int
+	TutorLosses        int
+	BossLosses         int
+	WeakLosses         int
+	Log                []string
+	StartTime          time.Time
+	LastEloCheck       time.Time
 }
 
 func (s *TrainingState) AddLog(msg string) {
@@ -198,8 +203,8 @@ func render(s *TrainingState) {
 
 	// Stats row
 	fmt.Printf("  %sMode%s  %-8s", gray, reset, s.Mode)
-	if s.Mode == "PRETRAIN" && s.PretrainCurrentDepth > 0 {
-		fmt.Printf("  %sDepth%s %-2d", gray, reset, s.PretrainCurrentDepth)
+	if s.Mode == "PRETRAIN" && s.PretrainDepthWhite > 0 && s.PretrainDepthBlack > 0 {
+		fmt.Printf("  %sDepth%s W/B %d/%d", gray, reset, s.PretrainDepthWhite, s.PretrainDepthBlack)
 	}
 	fmt.Printf("  %sBatch%s  %-6d  %sGames%s  %-6d  %sReplay%s  %-6d  %sUptime%s  %s\n",
 		gray, reset, s.Batch,
@@ -422,11 +427,20 @@ func main() {
 	bestPath := filepath.Join(filepath.Dir(cfg.CheckpointPath), "best.gob")
 	valueLossWeight := cfg.ValueLossWeight
 	policyLossWeight := cfg.PolicyLossWeight
-	pretrainDepth := cfg.PretrainDepth
-	pretrainDepth = max1(1, pretrainDepth)
+	pretrainDepthWhite := cfg.PretrainDepthWhite
+	pretrainDepthBlack := cfg.PretrainDepthBlack
+	if pretrainDepthWhite <= 0 {
+		pretrainDepthWhite = cfg.PretrainDepth
+	}
+	if pretrainDepthBlack <= 0 {
+		pretrainDepthBlack = cfg.PretrainDepth
+	}
+	pretrainDepthWhite = max1(1, pretrainDepthWhite)
+	pretrainDepthBlack = max1(1, pretrainDepthBlack)
 	pretrainBatchesDone := 0
 	pretrainBelowThreshold := 0
 	policySwitchWindow := max1(cfg.PolicySwitchWindow, 1)
+	pretrainHalfwaySwitched := false
 	var currentTutorDepthAtomic int32
 	var weakDepthAtomic int32
 	currentTutorDepth := 1
@@ -467,18 +481,20 @@ func main() {
 	}
 
 	state := &TrainingState{
-		Batch:                startBatch,
-		TargetElo:            cfg.TargetElo,
-		CurrentElo:           bestElo,
-		EloCheckEvery:        cfg.EloCheckEvery,
-		Mode:                 "RL",
-		PretrainCurrentDepth: 0,
-		StartTime:            time.Now(),
-		LastEloCheck:         time.Now(),
+		Batch:              startBatch,
+		TargetElo:          cfg.TargetElo,
+		CurrentElo:         bestElo,
+		EloCheckEvery:      cfg.EloCheckEvery,
+		Mode:               "RL",
+		PretrainDepthWhite: 0,
+		PretrainDepthBlack: 0,
+		StartTime:          time.Now(),
+		LastEloCheck:       time.Now(),
 	}
 	if mode == ModePretrain {
 		state.Mode = "PRETRAIN"
-		state.PretrainCurrentDepth = pretrainDepth
+		state.PretrainDepthWhite = pretrainDepthWhite
+		state.PretrainDepthBlack = pretrainDepthBlack
 	}
 
 	state.AddLog(fmt.Sprintf("Target ELO: %d", cfg.TargetElo))
@@ -524,19 +540,30 @@ func main() {
 
 	state.AddLog(fmt.Sprintf("Stockfish engine pools ready (%d each, T/W depth: %d/%d).", poolSize, currentTutorDepth, weakDepth))
 
-	var pretrainPool []*StockfishEngine
-	var pretrainCh chan *StockfishEngine
+	var pretrainPoolWhite []*StockfishEngine
+	var pretrainChWhite chan *StockfishEngine
+	var pretrainPoolBlack []*StockfishEngine
+	var pretrainChBlack chan *StockfishEngine
 	pretrainPoolSize := max1(cfg.Workers, 2)
 	if mode == ModePretrain {
-		pretrainPool, pretrainCh, err = newStockfishPool(pretrainPoolSize, pretrainDepth)
+		pretrainPoolWhite, pretrainChWhite, err = newStockfishPool(pretrainPoolSize, pretrainDepthWhite)
 		if err != nil {
 			closeStockfishPool(tutorPool)
 			closeStockfishPool(bossPool)
 			closeStockfishPool(weakPool)
-			fmt.Fprintf(os.Stderr, "stockfish pretrain init failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "stockfish pretrain white init failed: %v\n", err)
 			os.Exit(1)
 		}
-		state.AddLog(fmt.Sprintf("Pretrain pool ready (%d each, depth %d).", pretrainPoolSize, pretrainDepth))
+		pretrainPoolBlack, pretrainChBlack, err = newStockfishPool(pretrainPoolSize, pretrainDepthBlack)
+		if err != nil {
+			closeStockfishPool(tutorPool)
+			closeStockfishPool(bossPool)
+			closeStockfishPool(weakPool)
+			closeStockfishPool(pretrainPoolWhite)
+			fmt.Fprintf(os.Stderr, "stockfish pretrain black init failed: %v\n", err)
+			os.Exit(1)
+		}
+		state.AddLog(fmt.Sprintf("Pretrain pools ready (%d each, depth W/B %d/%d).", pretrainPoolSize, pretrainDepthWhite, pretrainDepthBlack))
 	}
 
 	// Graceful shutdown
@@ -545,10 +572,15 @@ func main() {
 	go func() {
 		<-sigCh
 		state.AddLog("Interrupt received — stopping after current batch.")
-		if pretrainPool != nil {
-			closeStockfishPool(pretrainPool)
-			pretrainPool = nil
-			pretrainCh = nil
+		if pretrainPoolWhite != nil {
+			closeStockfishPool(pretrainPoolWhite)
+			pretrainPoolWhite = nil
+			pretrainChWhite = nil
+		}
+		if pretrainPoolBlack != nil {
+			closeStockfishPool(pretrainPoolBlack)
+			pretrainPoolBlack = nil
+			pretrainChBlack = nil
 		}
 		currentTutorDepthSnapshot := int(atomic.LoadInt32(&currentTutorDepthAtomic))
 		weakDepthSnapshot := int(atomic.LoadInt32(&weakDepthAtomic))
@@ -599,7 +631,7 @@ func main() {
 
 		if mode == ModePretrain {
 			pretrainBatchesDone++
-			state.AddLog(fmt.Sprintf("Pretrain batch %d/%d — generating %d SF games at depth %d", pretrainBatchesDone, cfg.PretrainBatches, cfg.BatchSize, pretrainDepth))
+			state.AddLog(fmt.Sprintf("Pretrain batch %d/%d — generating %d SF games at depth W/B %d/%d", pretrainBatchesDone, cfg.PretrainBatches, cfg.BatchSize, pretrainDepthWhite, pretrainDepthBlack))
 			render(state)
 
 			var (
@@ -621,11 +653,11 @@ func main() {
 					defer wg.Done()
 					workerRNG := newRNG()
 					for range jobs {
-						sf1 := <-pretrainCh
-						sf2 := <-pretrainCh
+						sf1 := <-pretrainChWhite
+						sf2 := <-pretrainChBlack
 						rec := GenerateStockfishSelfPlayGame(sf1, sf2, workerRNG)
-						pretrainCh <- sf1
-						pretrainCh <- sf2
+						pretrainChWhite <- sf1
+						pretrainChBlack <- sf2
 						recordsMu.Lock()
 						allRecords = append(allRecords, rec)
 						moveCount += len(rec.Samples)
@@ -697,21 +729,39 @@ func main() {
 					batch, nSamples, totalLoss/den, valueLoss/den, policyLossAvg))
 			}
 
-			if policyLossAvg > 0 {
-				desiredDepth := pretrainDepthForPolicyLoss(policyLossAvg)
-				if desiredDepth != pretrainDepth {
-					closeStockfishPool(pretrainPool)
-					pretrainPool, pretrainCh, err = newStockfishPool(pretrainPoolSize, desiredDepth)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "stockfish pretrain reinit failed: %v\n", err)
-						os.Exit(1)
-					}
-					pretrainDepth = desiredDepth
-					state.mu.Lock()
-					state.PretrainCurrentDepth = pretrainDepth
-					state.mu.Unlock()
-					state.AddLog(fmt.Sprintf("Pretrain depth -> %d (policy loss %.2f)", pretrainDepth, policyLossAvg))
+			halfway := cfg.PretrainBatches / 2
+			if !pretrainHalfwaySwitched && halfway > 0 && pretrainBatchesDone >= halfway {
+				pretrainHalfwaySwitched = true
+				newWhite := pretrainDepthBlack
+				newBlack := pretrainDepthWhite
+				if pretrainPoolWhite != nil {
+					closeStockfishPool(pretrainPoolWhite)
+					pretrainPoolWhite = nil
+					pretrainChWhite = nil
 				}
+				if pretrainPoolBlack != nil {
+					closeStockfishPool(pretrainPoolBlack)
+					pretrainPoolBlack = nil
+					pretrainChBlack = nil
+				}
+				pretrainPoolWhite, pretrainChWhite, err = newStockfishPool(pretrainPoolSize, newWhite)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "stockfish pretrain white reinit failed: %v\n", err)
+					os.Exit(1)
+				}
+				pretrainPoolBlack, pretrainChBlack, err = newStockfishPool(pretrainPoolSize, newBlack)
+				if err != nil {
+					closeStockfishPool(pretrainPoolWhite)
+					fmt.Fprintf(os.Stderr, "stockfish pretrain black reinit failed: %v\n", err)
+					os.Exit(1)
+				}
+				pretrainDepthWhite = newWhite
+				pretrainDepthBlack = newBlack
+				state.mu.Lock()
+				state.PretrainDepthWhite = pretrainDepthWhite
+				state.PretrainDepthBlack = pretrainDepthBlack
+				state.mu.Unlock()
+				state.AddLog(fmt.Sprintf("Pretrain depth swap -> W/B %d/%d", pretrainDepthWhite, pretrainDepthBlack))
 			}
 
 			if policyLossAvg > 0 && policyLossAvg < cfg.PolicySwitchLoss {
@@ -725,14 +775,20 @@ func main() {
 				valueLossWeight = 1.0
 				policyLossWeight = 0.5
 				pretrainBelowThreshold = 0
-				if pretrainPool != nil {
-					closeStockfishPool(pretrainPool)
-					pretrainPool = nil
-					pretrainCh = nil
+				if pretrainPoolWhite != nil {
+					closeStockfishPool(pretrainPoolWhite)
+					pretrainPoolWhite = nil
+					pretrainChWhite = nil
+				}
+				if pretrainPoolBlack != nil {
+					closeStockfishPool(pretrainPoolBlack)
+					pretrainPoolBlack = nil
+					pretrainChBlack = nil
 				}
 				state.mu.Lock()
 				state.Mode = "RL"
-				state.PretrainCurrentDepth = 0
+				state.PretrainDepthWhite = 0
+				state.PretrainDepthBlack = 0
 				state.mu.Unlock()
 				state.AddLog("Pretraining complete — switching to RL")
 			}
@@ -1034,17 +1090,4 @@ func max1(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func pretrainDepthForPolicyLoss(loss float32) int {
-	if loss > 3.0 {
-		return 2
-	}
-	if loss > 2.0 {
-		return 3
-	}
-	if loss >= 1.5 {
-		return 4
-	}
-	return 4
 }

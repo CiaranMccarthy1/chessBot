@@ -57,12 +57,12 @@ func EstimateElo(net *AlphaNet, gamesPerDepth int, log func(string), progress fu
 	bestElo := 400 // floor
 	hitCeiling := false
 	evalExplore := ExploreConfig{
-		SelfExploreStart: 0,
-		SelfExploreEnd:   0,
-		VsExploreStart:   0,
-		VsExploreEnd:     0,
-		OpeningPly:       0,
-		OpeningTemp:      0,
+		SelfExploreStart: 0.02,
+		SelfExploreEnd:   0.02,
+		VsExploreStart:   0.02,
+		VsExploreEnd:     0.02,
+		OpeningPly:       6,
+		OpeningTemp:      0.5,
 		CurrentBatch:     1,
 		TotalBatches:     1,
 	}
